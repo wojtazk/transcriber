@@ -9,6 +9,7 @@ transcriber.py — lokalna transkrypcja nagrań (głównie wykładów PL). Wszys
   python transcriber.py wyklad.mp4 --web        # + notatka uzupełniona wiedzą z internetu
   python transcriber.py wyklad.mp4 --materials slajdy.pdf notatki.docx   # + czyste dane z prezentacji
   python transcriber.py wyklad.mp4 --all        # wszystko naraz
+  python transcriber.py wyklad_wyniki/wyklad_notatka.md   # tylko konwersja gotowej notatki do PDF
 
 Instalacja (jednorazowo):
   python3 -m venv .venv && source .venv/bin/activate     # Windows: .venv\\Scripts\\activate
@@ -776,7 +777,8 @@ class Qwen:
         os.close(fd)
         try:
             cv2.imwrite(tmp, img)
-            out = self.chat("Jaki napis jest na obrazku? Odpowiedz jednym słowem.", image=Path(tmp), max_tokens=4)
+            out = self.chat("Jaki napis jest na obrazku? Odpowiedz jednym słowem.", image=Path(tmp), max_tokens=4,
+                            max_rounds=0)
         finally:
             os.unlink(tmp)
         if not out:
@@ -788,50 +790,83 @@ class Qwen:
                 delattr(self, attr)
         free_memory()
 
-    def chat(self, prompt: str, image: Path | None = None, max_tokens: int = 2048,
-             progress: str | None = None) -> str:
+    def _generate(self, prompt: str, image: Path | None, max_tokens: int, progress: str | None,
+                  prefix: str = "") -> str:
+        """Surowa odpowiedź modelu; `prefix` = początek odpowiedzi, którą model ma kontynuować.
+        Ustawia self.truncated, gdy generowanie zatrzymał limit tokenów (a nie koniec odpowiedzi)."""
         img = _vlm_image(image) if image else None
         bar = tqdm(desc=progress, unit=" tok", leave=False) if progress else None
+        self.truncated = False
         try:
             parts = []
-            for piece in (self._mlx(prompt, img, max_tokens) if self.backend == "mlx"
-                          else self._hf(prompt, img, max_tokens)):
+            gen = self._mlx if self.backend == "mlx" else self._hf
+            for piece in gen(prompt, img, max_tokens, prefix):
                 parts.append(piece)
-                if bar:
+                if bar is not None:
                     bar.update(1)
         finally:
-            if bar:
+            if bar is not None:
                 bar.close()
             if img:
                 os.unlink(img)
-        return _THINK.sub("", "".join(parts)).strip()
+        return "".join(parts)
 
-    def _mlx(self, prompt, img, max_tokens):
+    def chat(self, prompt: str, image: Path | None = None, max_tokens: int = 2048,
+             progress: str | None = None, max_rounds: int = 3) -> str:
+        """Odpowiedź modelu. Gdy urwie się na limicie tokenów, model dostaje swój dotychczasowy tekst
+        jako początek odpowiedzi i pisze dalej (do `max_rounds` razy) – nic nie zostaje ucięte w połowie."""
+        text = self._generate(prompt, image, max_tokens, progress)
+        rounds = 0
+        while self.truncated and rounds < max_rounds:
+            rounds += 1
+            text += self._generate(prompt, image, max_tokens,
+                                   f"{progress} (cd. {rounds})" if progress else None, prefix=text)
+        if self.truncated:
+            # wciąż za długo – obcinamy do ostatniego pełnego akapitu, zamiast zostawiać pół zdania
+            cut = text.rstrip().rfind("\n\n")
+            if cut < len(text) * 0.6:  # brak akapitu blisko końca – tniemy do ostatniego pełnego zdania
+                cut = max(text.rfind(". "), text.rfind(".\n"), text.rfind("? "), text.rfind("! ")) + 1
+            if cut > len(text) * 0.6:
+                text = text[:cut]
+        return _THINK.sub("", text).strip()
+
+    def _mlx(self, prompt, img, max_tokens, prefix=""):
         from mlx_vlm import stream_generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
         formatted = apply_chat_template(self.processor, self.config, prompt, num_images=1 if img else 0)
+        formatted += prefix  # kontynuacja: dopisujemy początek odpowiedzi asystenta
+        last = None
         for r in stream_generate(self.model, self.processor, formatted, image=[img] if img else None,
                                  max_tokens=max_tokens, temperature=0.0, repetition_penalty=1.05):
+            last = r
             yield r.text
+        if last is not None:
+            self.truncated = getattr(last, "finish_reason", None) == "length" or \
+                getattr(last, "generation_tokens", 0) >= max_tokens
 
-    def _hf(self, prompt, img, max_tokens):
+    def _hf(self, prompt, img, max_tokens, prefix=""):
         import torch
         from transformers import TextIteratorStreamer
 
         content = ([{"type": "image", "image": img}] if img else []) + [{"type": "text", "text": prompt}]
+        messages = [{"role": "user", "content": content}]
+        if prefix:
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": prefix}]})
         inputs = self.processor.apply_chat_template(
-            [{"role": "user", "content": content}], tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt",
+            messages, tokenize=True, return_dict=True, return_tensors="pt",
+            add_generation_prompt=not prefix, continue_final_message=bool(prefix),
         ).to(self.model.device)
+        n_in = inputs["input_ids"].shape[1]
         streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
-        errors = []
+        errors, n_out = [], [0]
 
         def gen():
             try:
                 with torch.inference_mode():
-                    self.model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False,
-                                        repetition_penalty=1.05, streamer=streamer)
+                    out = self.model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False,
+                                              repetition_penalty=1.05, streamer=streamer)
+                n_out[0] = out.shape[1] - n_in
             except Exception as e:  # przekaż błąd do wątku głównego
                 errors.append(e)
                 streamer.end()
@@ -842,6 +877,7 @@ class Qwen:
         th.join()
         if errors:
             raise errors[0]
+        self.truncated = n_out[0] >= max_tokens
 
     def close(self) -> None:
         self._unload()
@@ -858,9 +894,14 @@ CHUNK_PROMPT = """Poniżej fragment transkrypcji wykładu ({start}–{end}) z op
 Transkrypcja pochodzi z automatycznego rozpoznawania mowy – może zawierać błędy, popraw je z kontekstu.
 
 Sporządź szczegółowe notatki do nauki z tego fragmentu w Markdown:
-- główne zagadnienia jako nagłówki ###, z czasem rozpoczęcia [hh:mm:ss],
-- definicje, twierdzenia, wzory (LaTeX), przykłady i ważne uwagi prowadzącego,
-- odwołuj się do slajdów jako (slajd N).
+- definicje, twierdzenia, wzory (LaTeX), przykłady, polecenia/kod i ważne uwagi prowadzącego.
+
+Format – ściśle:
+- każde zagadnienie jako nagłówek `### Tytuł [hh:mm:ss]` (czas rozpoczęcia); podpunkty ewentualnie jako `####`,
+- NIE używaj nagłówków `#` ani `##`,
+- NIE dodawaj sekcji „Podsumowanie”, „Pytania”, „Pojęcia”, „TL;DR” ani „Slajdy” – zostaną dodane osobno,
+- o slajdzie pisz tam, gdzie prowadzący go omawia, z dopiskiem (slajd N) w tekście –
+  nie wypisuj slajdów w osobnej liście.
 Jeśli przy slajdzie jest „Treść z materiałów”, to dokładny tekst slajdu z prezentacji prowadzącego –
 przy definicjach i wzorach trzymaj się go (opis z nagrania może zawierać błędy).
 Pisz po polsku, rzeczowo, bez wstępów.
@@ -868,31 +909,39 @@ Pisz po polsku, rzeczowo, bez wstępów.
 --- FRAGMENT ---
 {body}"""
 
-MERGE_PROMPT = """Poniżej notatki cząstkowe z kolejnych fragmentów jednego wykładu.
-Złóż je w JEDNĄ spójną notatkę do nauki w Markdown, po polsku, o strukturze:
+HEAD_PROMPT = """Poniżej notatki z kolejnych części jednego wykładu.
+Napisz WYŁĄCZNIE początek notatki do nauki w Markdown, dokładnie w tym formacie:
 
-# <tytuł wykładu>
+# <krótki, konkretny tytuł wykładu>
+
 ## TL;DR
-(3–5 zdań)
+<3–5 zdań: o czym był wykład i co z niego najważniejsze>
+
 ## Najważniejsze pojęcia
-(lista: pojęcie – krótka definicja)
-## Przebieg wykładu
-(sekcje ### z czasami [hh:mm:ss], szczegółowo, z wzorami i przykładami; zachowaj odwołania do slajdów)
-## Pytania kontrolne
-(5–10 pytań sprawdzających zrozumienie)
+- **<pojęcie>** – <krótka definicja>
+<8–15 pozycji, w kolejności z wykładu>
 
-Usuń powtórzenia, nie pomijaj treści merytorycznych, nie wymyślaj nowych faktów.
-Notatki oznaczone [Z MATERIAŁÓW] pochodzą z prezentacji/notatek prowadzącego – wpleć je w pasujące miejsca
-przebiegu wykładu (są dokładne w definicjach i wzorach); to, czego nie omówiono na wykładzie, umieść
-w osobnej sekcji „## Z materiałów (nieomówione na wykładzie)”.
+Nie pisz nic więcej (żadnych innych sekcji). Pisz po polsku, rzeczowo, nie wymyślaj faktów.
+{web}
+--- NOTATKI ---
+{body}"""
 
---- NOTATKI CZĄSTKOWE ---
+QUESTIONS_PROMPT = """Na podstawie poniższych notatek z wykładu ułóż 6–10 pytań kontrolnych sprawdzających zrozumienie
+materiału – od prostszych do trudniejszych. Wypisz je jako listę numerowaną, bez odpowiedzi, bez nagłówka
+i bez wstępu. Po polsku.
+
+--- NOTATKI ---
+{body}"""
+
+CONDENSE_PROMPT = """Streść poniższe notatki z części wykładu w zwięzłych punktach (maks. ok. 250 słów).
+Zachowaj wszystkie kluczowe pojęcia, definicje i wzory. Bez wstępów, po polsku.
+
 {body}"""
 
 
 def describe_slides(qwen: Qwen, slides: list[Slide], slides_dir: Path) -> None:
     for s in tqdm([s for s in slides if not s.description], desc="           qwen-vl", unit="slajd", leave=False):
-        s.description = qwen.chat(SLIDE_PROMPT, image=slides_dir / s.file, max_tokens=1024)
+        s.description = qwen.chat(SLIDE_PROMPT, image=slides_dir / s.file, max_tokens=1536, max_rounds=1)
 
 
 def timeline_chunks(segments: list[Segment], slides: list[Slide], max_chars: int):
@@ -928,37 +977,137 @@ MAX_CHARS = 12000  # ~4-5k tokenów na fragment – bezpiecznie dla 16 GB RAM
 
 
 def partial_notes(qwen: Qwen, segments: list[Segment], slides: list[Slide],
-                  pages: list[Page] | None = None) -> list[str]:
+                  pages: list[Page] | None = None, cache: Path | None = None) -> tuple[list[str], int]:
+    """Notatki z kolejnych fragmentów. Każda gotowa notatka trafia od razu do `cache`, więc po
+    przerwaniu/błędzie kolejne uruchomienie liczy tylko brakujące fragmenty (te same dane = ten sam klucz)."""
+    import hashlib
+
     jobs = [CHUNK_PROMPT.format(start=fmt_ts(a, False), end=fmt_ts(b, False), body=body)
             for a, b, body in timeline_chunks(segments, slides, MAX_CHARS)]
     n_lecture = len(jobs)
     jobs += [MATERIAL_PROMPT.format(body=body) for body in material_chunks(pages or [], MAX_CHARS)]
-    out = []
+
+    def key(prompt: str) -> str:
+        return hashlib.sha256(f"v2\n{qwen.name}\n{prompt}".encode()).hexdigest()[:24]
+
+    saved: dict[str, str] = {}
+    if cache and cache.exists():
+        try:
+            saved = json.loads(cache.read_text("utf-8"))
+        except Exception:
+            saved = {}
+    out, reused = [], 0
     for i, prompt in enumerate(tqdm(jobs, desc="           fragmenty", unit="fragm", leave=False)):
-        note = qwen.chat(prompt)
-        out.append(note if i < n_lecture else f"[Z MATERIAŁÓW]\n{note}")
-    return out
+        k = key(prompt)
+        if k in saved:
+            note, reused = saved[k], reused + 1
+        else:
+            note = qwen.chat(prompt, max_tokens=3072)
+            saved[k] = note
+            if cache:
+                cache.write_text(json.dumps(saved, ensure_ascii=False), "utf-8")
+        out.append(note if i < n_lecture else f"{MATERIAL_TAG}\n{note}")
+    return out, reused
+
+
+MATERIAL_TAG = "[Z MATERIAŁÓW]"
+
+
+_DROP_SECTIONS = re.compile(
+    r"^(tl;?dr|pytania( kontrolne| sprawdzające| do powtórki)?|(najważniejsze|kluczowe) pojęcia|"
+    r"słowniczek|podsumowanie( fragmentu)?)\s*[:.]?\s*$", re.IGNORECASE)
+_DROP_HEADING_ONLY = re.compile(r"^(przebieg wykładu|notatk\w*( z \w+)?|fragment\w*)\b", re.IGNORECASE)
+
+
+def _as_subsections(note: str) -> str:
+    """Normalizuje notatkę z fragmentu, żeby po sklejeniu struktura dokumentu była spójna:
+      • usuwa sekcje dublujące części globalne (TL;DR, pytania, pojęcia, podsumowanie fragmentu),
+      • usuwa nagłówki-meta ("Notatki z fragmentu…", "Przebieg wykładu"), zostawiając treść,
+      • przesuwa poziomy nagłówków tak, że najwyższy to ### (pod "## Przebieg wykładu"), maks. #####."""
+    lines = note.strip().splitlines()
+    heads, fence = [], False
+    for i, line in enumerate(lines):
+        st = line.strip()
+        if st.startswith("```"):
+            fence = not fence
+        m = None if fence else _HEADING.match(line)
+        if m:
+            title = re.sub(r"\s*\[[\d:–\-\s]+\]\s*$", "", m.group(2).strip()).strip("*_ ")
+            heads.append((i, len(m.group(1)), m.group(2).strip(), title))
+
+    drop: set[int] = set()
+    for k, (i, lvl, _, title) in enumerate(heads):
+        if _DROP_SECTIONS.match(title):
+            end = next((j for j, l2, _, _ in heads[k + 1:] if l2 <= lvl), len(lines))
+            drop.update(range(i, end))
+        elif _DROP_HEADING_ONLY.match(title):
+            drop.add(i)
+    kept = [(i, lvl, txt) for i, lvl, txt, _ in heads if i not in drop]
+    base = min((lvl for _, lvl, _ in kept), default=3)
+    new_head = {i: "#" * min(5, 3 + lvl - base) + " " + txt for i, lvl, txt in kept}
+    out = [new_head.get(i, line) for i, line in enumerate(lines) if i not in drop]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+def _strip_leading_headings(text: str) -> str:
+    lines = text.strip().splitlines()
+    while lines and (_HEADING.match(lines[0]) or not lines[0].strip()):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def condense(qwen: Qwen, notes: list[str], limit: int = 2 * MAX_CHARS) -> str:
+    """Skrót wszystkich notatek, mieszczący się w kontekście – do tytułu, TL;DR i pytań."""
+    while sum(map(len, notes)) > limit and notes:
+        groups, cur, size = [], [], 0
+        for n in notes:
+            if size + len(n) > MAX_CHARS and cur:
+                groups.append(cur)
+                cur, size = [], 0
+            cur.append(n)
+            size += len(n)
+        groups.append(cur)
+        notes = [qwen.chat(CONDENSE_PROMPT.format(body="\n\n".join(g)), max_tokens=768)
+                 for g in tqdm(groups, desc="           streszczanie", unit="część", leave=False)]
+        if len(groups) == 1:
+            break
+    return "\n\n---\n\n".join(notes)[: limit + MAX_CHARS]
 
 
 def final_notes(qwen: Qwen, partial: list[str], web: str = "") -> str:
-    # redukcja hierarchiczna, gdy całość nie mieści się w kontekście
-    while len(partial) > 1 and sum(map(len, partial)) > MAX_CHARS:
-        groups, cur, size = [], [], 0
-        for p in partial:
-            if size + len(p) > MAX_CHARS and cur:
-                groups.append(cur)
-                cur, size = [], 0
-            cur.append(p)
-            size += len(p)
-        groups.append(cur)
-        if len(groups) == len(partial):
-            break
-        partial = [qwen.chat(MERGE_PROMPT.format(body="\n\n---\n\n".join(g)))
-                   for g in tqdm(groups, desc="           scalanie", unit="część", leave=False)]
-    prompt = MERGE_PROMPT.format(body="\n\n---\n\n".join(partial))
+    """Składa notatkę końcową z części, zamiast generować całość jednym (długim, ucinanym) wywołaniem:
+      • tytuł + TL;DR + pojęcia  – krótkie wywołanie modelu na skrócie całości,
+      • Przebieg wykładu          – szczegółowe notatki z kolejnych fragmentów (już policzone),
+      • Z materiałów              – notatki ze stron prezentacji nieomówionych na nagraniu,
+      • Pytania kontrolne / Dodatkowe materiały – osobne krótkie wywołania."""
+    lecture = [p for p in partial if not p.startswith(MATERIAL_TAG)]
+    mats = [p[len(MATERIAL_TAG):].strip() for p in partial if p.startswith(MATERIAL_TAG)]
+    digest = condense(qwen, lecture + mats)
+
+    head = qwen.chat(HEAD_PROMPT.format(body=digest, web=WEB_HEAD.format(web=web) if web else ""),
+                     max_tokens=2048, progress="           tytuł, TL;DR, pojęcia")
+    if not head.lstrip().startswith("# "):
+        head = "# Notatka z wykładu\n\n" + head
+    first, rest = head.strip().split("\n", 1) if "\n" in head.strip() else (head.strip(), "")
+    rest = re.sub(r"^#\s", "## ", rest, flags=re.MULTILINE)  # kolejne "# …" w głowie -> "## …"
+    head = first + ("\n" + rest if rest else "")
+    questions = _strip_leading_headings(
+        qwen.chat(QUESTIONS_PROMPT.format(body=digest), max_tokens=1024, progress="           pytania kontrolne"))
+    sources = ""
     if web:
-        prompt += WEB_ADDON.format(web=web)
-    return qwen.chat(prompt, max_tokens=4096, progress="           generowanie")
+        topic = re.sub(r"\s+", " ", head)[:600]
+        sources = _strip_leading_headings(
+            qwen.chat(WEB_SECTION_PROMPT.format(web=web, topic=topic), max_tokens=1536,
+                      progress="           dodatkowe materiały"))
+
+    parts = [head.strip(), "## Przebieg wykładu", *(_as_subsections(n) for n in lecture)]
+    if mats:
+        parts += ["## Z materiałów (nieomówione na wykładzie)", *(_as_subsections(n) for n in mats)]
+    if questions:
+        parts += ["## Pytania kontrolne", questions]
+    if sources:
+        parts += ["## Dodatkowe materiały", sources]
+    return "\n\n".join(p for p in parts if p.strip()) + "\n"
 
 
 # ============================================================================
@@ -1082,7 +1231,7 @@ def load_materials(files: list[Path], render_dir: Path) -> list[Page]:
 def describe_pages(qwen: Qwen, pages: list[Page]) -> int:
     todo = [p for p in pages if p.image and not p.description]
     for p in tqdm(todo, desc="           strony-obrazy", unit="str", leave=False):
-        p.description = qwen.chat(SLIDE_PROMPT, image=Path(p.image), max_tokens=1024)
+        p.description = qwen.chat(SLIDE_PROMPT, image=Path(p.image), max_tokens=1536, max_rounds=1)
     return len(todo)
 
 
@@ -1153,14 +1302,21 @@ Zapytania po polsku (lub po angielsku, jeśli termin jest angielski). Jedno zapy
 --- NOTATKI ---
 {body}"""
 
-WEB_ADDON = """
-
---- WYNIKI WYSZUKIWANIA W INTERNECIE ---
+WEB_HEAD = """
+--- WYNIKI WYSZUKIWANIA W INTERNECIE (pomocniczo) ---
 {web}
 
-Wykorzystaj powyższe wyniki tylko do doprecyzowania definicji i uzupełnienia kontekstu – treść wykładu jest najważniejsza.
-Informacje, których nie było na wykładzie, oznacz dopiskiem „(źródło: internet)”.
-Na końcu notatki dodaj sekcję „## Dodatkowe materiały” z krótkimi wyjaśnieniami i linkami [tytuł](url) do źródeł, z których skorzystałeś."""
+Wyników użyj tylko do doprecyzowania definicji pojęć – treść wykładu jest najważniejsza.
+Definicje uzupełnione z internetu oznacz dopiskiem „(źródło: internet)”.
+"""
+
+WEB_SECTION_PROMPT = """Poniżej wyniki wyszukiwania w internecie dotyczące pojęć z wykładu (krótko o wykładzie: {topic}).
+Wybierz 3–8 najbardziej przydatnych źródeł do nauki i dla każdego napisz jedną linię w formacie:
+- [tytuł](url) – czego można się z niego dowiedzieć w kontekście tego wykładu
+Pomiń źródła niezwiązane z tematem. Bez nagłówka i bez wstępu. Po polsku.
+
+--- WYNIKI ---
+{web}"""
 
 
 def web_context(qwen: Qwen, partial: list[str], max_queries: int, per_query: int) -> tuple[str, int]:
@@ -1170,7 +1326,7 @@ def web_context(qwen: Qwen, partial: list[str], max_queries: int, per_query: int
         raise RuntimeError("brak pakietu ddgs (pip install ddgs)") from e
 
     body = "\n\n".join(partial)[:MAX_CHARS]
-    raw = qwen.chat(QUERY_PROMPT.format(n=max_queries, body=body), max_tokens=256)
+    raw = qwen.chat(QUERY_PROMPT.format(n=max_queries, body=body), max_tokens=256, max_rounds=0)
     queries = [re.sub(r"^[\s\-*\d.)]+", "", q).strip().strip('"') for q in raw.splitlines()]
     queries = [q for q in queries if len(q) > 2][:max_queries]
 
@@ -1188,6 +1344,332 @@ def web_context(qwen: Qwen, partial: list[str], max_queries: int, per_query: int
             seen.add(url)
             blocks.append(f"- [{r.get('title', '').strip()}]({url})\n  {r.get('body', '').strip()}")
     return "\n".join(blocks), len(queries)
+
+
+# ============================================================================
+# 5b. Wstawianie slajdów w treść notatki (tam, gdzie model się do nich odwołuje)
+# ============================================================================
+
+_SLIDE_REF = re.compile(
+    r"\bslajd\w*\s+(?:nr\.?\s*)?(\d+(?:\s*(?:[,–—-]|\bi\b|\boraz\b|\bdo\b)\s*\d+)*)", re.IGNORECASE)
+_HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
+_TS = re.compile(r"\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]")
+# sekcje, w których odwołanie do slajdu nie jest dobrym miejscem na obrazek
+_SKIP_SECTIONS = re.compile(r"tl;?dr|pytania|pojęcia|dodatkowe materiały|nieomówione|źródła", re.IGNORECASE)
+
+
+def _slide_numbers(match: str) -> list[int]:
+    nums: list[int] = []
+    for a, sep, b in re.findall(r"(\d+)\s*(?:([–—-]|\bdo\b)\s*(\d+))?", match):
+        if sep and b and 0 <= int(b) - int(a) <= 30:
+            nums += range(int(a), int(b) + 1)
+        else:
+            nums.append(int(a))
+            if b:
+                nums.append(int(b))
+    return nums
+
+
+MAX_SLIDES_PER_BLOCK = 3  # więcej obrazków pod jednym akapitem = "wysyp"; reszta idzie do sekcji na końcu
+
+
+def _slide_description(sl: Slide) -> list[str]:
+    """Opis slajdu (z Qwen3-VL) jako zwykły tekst notatki – nagłówki z opisu zamieniamy na pogrubienie,
+    żeby nie rozbijały struktury dokumentu."""
+    text = (sl.description or sl.material_text or "").strip()
+    if not text:
+        return []
+    out = []
+    for line in text.splitlines():
+        m = _HEADING.match(line)
+        out.append(f"**{m.group(2).strip()}**" if m else line)
+    return ["", *out, ""]
+
+
+def _figure(sl: Slide) -> list[str]:
+    ts = fmt_ts(sl.time, False)
+    src = f"slajdy/{sl.file}"
+    return ["", f'<figure><img src="{src}" alt="Slajd {sl.index}">'
+                f"<figcaption>Slajd {sl.index} · {ts}</figcaption></figure>", ""]
+
+
+def embed_slides(notes: str, slides: list[Slide]) -> tuple[str, dict[str, int]]:
+    """Wstawia obrazy slajdów w notatkę:
+      1) pod blokiem (akapit/lista), w którym model pierwszy raz pisze „(slajd N)” – w części merytorycznej,
+         maks. MAX_SLIDES_PER_BLOCK pod jednym blokiem,
+      2) pozostałe – w sekcji „Slajdy bez odwołań w notatce” na końcu, każdy z opisem wygenerowanym przez model."""
+    by_idx = {sl.index: sl for sl in slides}
+    lines = notes.splitlines()
+    n = len(lines)
+
+    # podział na linie: czy w kodzie/wzorze, czy nagłówek; bloki = ciągi linii między pustymi
+    # liniami i nagłówkami (nagłówek to osobny blok – modele często nie dają pustych linii)
+    in_fence = [False] * n
+    fence = None
+    for ln, text in enumerate(lines):
+        st = text.strip()
+        if fence:
+            in_fence[ln] = True
+            if (fence == "```" and st.startswith("```")) or (fence == "$$" and st.endswith("$$")):
+                fence = None
+        elif st.startswith("```"):
+            in_fence[ln], fence = True, "```"
+        elif st.startswith("$$"):
+            in_fence[ln] = True
+            if not (len(st) > 4 and st.endswith("$$")):
+                fence = "$$"
+    is_heading = [bool(_HEADING.match(t)) and not in_fence[i] for i, t in enumerate(lines)]
+
+    blocks: list[tuple[int, int]] = []
+    start = None
+    for ln in range(n):
+        blank = not lines[ln].strip() and not in_fence[ln]
+        if blank or is_heading[ln]:
+            if start is not None:
+                blocks.append((start, ln - 1))
+                start = None
+            if is_heading[ln]:
+                blocks.append((ln, ln))
+            continue
+        if start is None:
+            start = ln
+    if start is not None:
+        blocks.append((start, n - 1))
+
+    # nagłówki: poziom, czas (jeśli jest), czy to sekcja "pomijana"
+    headings: list[tuple[int, int, float | None]] = []  # (linia, poziom, czas)
+    skip_line = [False] * n
+    cur_skip = False
+    for ln, text in enumerate(lines):
+        m = _HEADING.match(text) if is_heading[ln] else None
+        if m:
+            level, title = len(m.group(1)), m.group(2)
+            t = _TS.search(title)
+            sec = None
+            if t:
+                h, mi, se = (int(t.group(1)), int(t.group(2)), int(t.group(3) or 0)) if t.group(3) \
+                    else (0, int(t.group(1)), int(t.group(2)))
+                sec = h * 3600 + mi * 60 + se
+            headings.append((ln, level, sec))
+            if level <= 2:  # tylko sekcje główne decydują (TL;DR, pojęcia, pytania…); ### dziedziczą
+                cur_skip = bool(_SKIP_SECTIONS.search(title))
+        skip_line[ln] = cur_skip
+
+    insert_after: dict[int, list[Slide]] = {}
+    placed: set[int] = set()
+    stats = {"przy_odwolaniu": 0, "na_koncu": 0}
+
+    # 1) przy pierwszym odwołaniu (pomijamy nagłówki, kod, wzory i sekcje typu TL;DR/pytania)
+    for a, b in blocks:
+        if is_heading[a]:
+            continue
+        text = "\n".join(lines[ln] for ln in range(a, b + 1)
+                         if not skip_line[ln] and not in_fence[ln] and "<figure" not in lines[ln])
+        for m in _SLIDE_REF.finditer(text):
+            nums = _slide_numbers(m.group(1))
+            if len(nums) > MAX_SLIDES_PER_BLOCK:
+                continue  # szeroki zakres ("slajdy 5–12") – nie wstawiamy części, całość trafi na koniec
+            for k in nums:
+                if k in by_idx and k not in placed and len(insert_after.get(b, [])) < MAX_SLIDES_PER_BLOCK:
+                    placed.add(k)
+                    insert_after.setdefault(b, []).append(by_idx[k])
+                    stats["przy_odwolaniu"] += 1
+
+    out: list[str] = []
+    for ln, text in enumerate(lines):
+        out.append(text)
+        for sl in sorted(insert_after.get(ln, []), key=lambda x: x.index):
+            out += _figure(sl)
+    rest = [sl for sl in slides if sl.index not in placed]
+    if rest:
+        out += ["", "---", "", "## Slajdy bez odwołań w notatce", "",
+                "Slajdy pokazane na wykładzie, do których notatka się nie odwołuje – z opisem treści.", ""]
+        for sl in rest:
+            out += ["", f"### Slajd {sl.index} · {fmt_ts(sl.time, False)}"]
+            out += _figure(sl)
+            out += _slide_description(sl)
+        stats["na_koncu"] = len(rest)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip() + "\n", stats
+
+
+# ============================================================================
+# 6. Eksport notatki do PDF (Markdown -> HTML + KaTeX -> Chromium -> PDF)
+# ============================================================================
+
+KATEX = "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist"
+
+PDF_CSS = """
+@page { size: A4; margin: 18mm 16mm 20mm 16mm; }
+:root { --ink:#1d1f23; --muted:#5b616b; --line:#e3e6ea; --accent:#2457c5; --code:#f5f7fa; }
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body { font-family: "Inter","Segoe UI","Noto Sans","DejaVu Sans",Arial,sans-serif; color: var(--ink);
+       font-size: 10.5pt; line-height: 1.55; margin: 0; }
+h1 { font-size: 22pt; line-height: 1.2; margin: 0 0 6mm; padding-bottom: 3mm; border-bottom: 2px solid var(--accent); }
+h2 { font-size: 15pt; margin: 9mm 0 3mm; color: var(--accent); break-after: avoid; }
+h3 { font-size: 12pt; margin: 6mm 0 2mm; break-after: avoid; }
+h4 { font-size: 10.5pt; margin: 4mm 0 1mm; break-after: avoid; }
+p, ul, ol { margin: 0 0 2.5mm; }
+li { margin: 0.6mm 0; }
+li > ul, li > ol { margin-top: 0.6mm; }
+strong { font-weight: 650; }
+a { color: var(--accent); text-decoration: none; word-break: break-word; }
+hr { border: 0; border-top: 1px solid var(--line); margin: 7mm 0; }
+blockquote { margin: 3mm 0; padding: 2mm 4mm; border-left: 3px solid var(--accent); background: #f3f6fc; color: var(--muted); }
+code { font-family: "JetBrains Mono","Fira Code","DejaVu Sans Mono",Consolas,monospace; font-size: 9pt;
+       background: var(--code); padding: 0.3mm 1mm; border-radius: 2px; }
+pre { background: var(--code); border: 1px solid var(--line); border-radius: 4px; padding: 3mm 4mm;
+      white-space: pre-wrap; word-break: break-word; break-inside: avoid; }
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 3mm 0; font-size: 9.5pt; break-inside: avoid; }
+th, td { border: 1px solid var(--line); padding: 1.5mm 2.5mm; text-align: left; vertical-align: top; }
+th { background: #f0f3f8; }
+figure { margin: 3mm 0 5mm; break-inside: avoid; text-align: center; }
+figure img { max-height: 80mm; margin: 0 auto 1.5mm; }
+figcaption { font-size: 8.5pt; color: var(--muted); }
+img { max-width: 100%; max-height: 120mm; display: block; margin: 2mm auto 5mm; border: 1px solid var(--line);
+      border-radius: 3px; break-inside: avoid; }
+.katex-display { margin: 3mm 0; overflow-x: auto; overflow-y: hidden; }
+"""
+
+PDF_HTML = """<!doctype html>
+<html lang="pl"><head><meta charset="utf-8"><title>{title}</title>
+<link rel="stylesheet" href="{katex}/katex.min.css">
+<style>{css}</style>
+<script defer src="{katex}/katex.min.js"></script>
+<script defer src="{katex}/contrib/auto-render.min.js"
+  onload="renderMathInElement(document.body,{{delimiters:[{{left:'\\\\[',right:'\\\\]',display:true}},{{left:'\\\\(',right:'\\\\)',display:false}}],throwOnError:false}});document.body.dataset.math='ok'"></script>
+</head><body>
+{body}
+</body></html>"""
+
+
+def _fix_markdown(md: str) -> str:
+    """Modele często piszą listę albo wzór $$…$$ tuż pod akapitem, bez pustej linii –
+    Markdown nie uznałby ich wtedy za listę / blok wzoru. Dokładamy brakujące puste linie."""
+    # 1) bloki wzorów $$ … $$ (także jednoliniowe) zawsze otoczone pustymi liniami
+    lines, fixed, in_math = md.splitlines(), [], False
+    for line in lines:
+        st = line.strip()
+        opens = st.startswith("$$") and not in_math
+        single = opens and len(st) > 4 and st.endswith("$$")
+        if opens:
+            if fixed and fixed[-1].strip():
+                fixed.append("")
+            fixed.append(line)
+            if single:
+                fixed.append("")
+            else:
+                in_math = True
+            continue
+        fixed.append(line)
+        if in_math and st.endswith("$$"):
+            in_math = False
+            fixed.append("")
+    # 2) listy tuż pod akapitem
+    out, prev = [], ""
+    for line in fixed:
+        is_item = re.match(r"\s*([-*+]|\d+[.)])\s+", line)
+        prev_item = re.match(r"\s*([-*+]|\d+[.)])\s+", prev)
+        if is_item and prev.strip() and not prev_item and not prev.lstrip().startswith(("#", "|", ">")) \
+                and not line.startswith((" ", "\t")):
+            out.append("")
+        out.append(line)
+        prev = line
+    return "\n".join(out)
+
+
+def markdown_to_html(md: str, title: str) -> str:
+    import html
+
+    import markdown
+
+    body = markdown.markdown(
+        _fix_markdown(md),
+        extensions=["extra", "sane_lists", "pymdownx.arithmatex", "pymdownx.tilde"],
+        extension_configs={"pymdownx.arithmatex": {"generic": True}},
+    )
+    return PDF_HTML.format(title=html.escape(title), css=PDF_CSS, katex=KATEX, body=body)
+
+
+def _system_browser() -> str | None:
+    import shutil
+
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome",
+                 "microsoft-edge", "microsoft-edge-stable", "brave", "brave-browser"):
+        if p := shutil.which(name):
+            return p
+    for p in ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+              "/Applications/Chromium.app/Contents/MacOS/Chromium",
+              "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+              r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+              r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+              r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _launch_browser(pw):
+    """Najpierw przeglądarka z systemu (bez pobierania), potem Chromium Playwrighta w ./models/playwright."""
+    import subprocess
+
+    exe = _system_browser()
+    if exe:
+        try:
+            return pw.chromium.launch(executable_path=exe), Path(exe).name
+        except Exception as e:
+            log(f"! {Path(exe).name} nie wystartował ({err_msg(e)}) – używam Chromium z Playwrighta")
+    try:
+        return pw.chromium.launch(), "chromium (playwright)"
+    except Exception:
+        pass
+    log("Pobieram Chromium do eksportu PDF → models/playwright (jednorazowo)…")
+    env = {**os.environ, "PLAYWRIGHT_BROWSERS_PATH": str(MODELS_DIR / "playwright")}
+    cmd = [sys.executable, "-m", "playwright", "install", "--only-shell", "chromium"]
+    if subprocess.run(cmd, env=env).returncode != 0 and \
+            subprocess.run(cmd[:-2] + ["chromium"], env=env).returncode != 0:
+        raise RuntimeError("nie mogę pobrać Chromium (brak internetu?). Zainstaluj Chrome/Chromium "
+                           "albo uruchom: python -m playwright install chromium")
+    return pw.chromium.launch(), "chromium (playwright)"
+
+
+def markdown_to_pdf(md_path: Path, pdf_path: Path | None = None) -> tuple[Path, str]:
+    """Notatka .md -> ładny PDF (wzory LaTeX, tabele, obrazki slajdów, numery stron)."""
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(MODELS_DIR / "playwright"))
+    from playwright.sync_api import sync_playwright
+
+    md_path = md_path.resolve()
+    pdf_path = (pdf_path or md_path.with_suffix(".pdf")).resolve()
+    md = md_path.read_text(encoding="utf-8")
+    m = re.search(r"^#\s+(.+)$", md, re.MULTILINE)
+    title = m.group(1).strip() if m else md_path.stem
+    # HTML obok .md, żeby względne ścieżki do slajdów (slajdy/…jpg) działały
+    html_path = md_path.with_name(f".{md_path.stem}.pdf.html")
+    html_path.write_text(markdown_to_html(md, title), encoding="utf-8")
+    try:
+        with sync_playwright() as pw:
+            browser, used = _launch_browser(pw)
+            try:
+                page = browser.new_page()
+                try:
+                    page.goto(html_path.as_uri(), wait_until="networkidle", timeout=60000)
+                except Exception:
+                    page.goto(html_path.as_uri(), wait_until="load", timeout=60000)
+                try:  # wzory renderuje KaTeX (z CDN); bez internetu zostaną jako tekst LaTeX
+                    page.wait_for_function("document.body.dataset.math === 'ok'", timeout=15000)
+                except Exception:
+                    used += ", wzory jako tekst (brak KaTeX/internetu)"
+                page.pdf(
+                    path=str(pdf_path), format="A4", print_background=True, prefer_css_page_size=True,
+                    display_header_footer=True, header_template="<div></div>",
+                    footer_template='<div style="width:100%;font-size:8px;color:#8a9099;text-align:center;">'
+                                    '<span class="pageNumber"></span> / <span class="totalPages"></span></div>',
+                )
+            finally:
+                browser.close()
+    finally:
+        html_path.unlink(missing_ok=True)
+    return pdf_path, used
 
 
 # ============================================================================
@@ -1218,7 +1700,11 @@ def save_json(path: Path, items) -> None:
 
 
 def load_json(path: Path, cls):
-    return [cls(**d) for d in json.loads(path.read_text("utf-8"))]
+    """Wczytuje cache; pola nieznane tej wersji skryptu (np. z innej wersji) są pomijane."""
+    from dataclasses import fields
+
+    known = {f.name for f in fields(cls)}
+    return [cls(**{k: v for k, v in d.items() if k in known}) for d in json.loads(path.read_text("utf-8"))]
 
 
 # ============================================================================
@@ -1239,7 +1725,8 @@ def process(video: Path, args, device: str) -> None:
 
     mat_files = find_materials(video, args.materials) if args.summary else []
     total = (3 + (1 if args.speakers else 0) + (1 if args.extract else 0)
-             + (5 if args.summary else 0) + (2 if mat_files else 0) + (1 if args.web else 0))
+             + (5 if args.summary else 0) + (1 if args.summary and not args.no_pdf else 0)
+             + (2 if mat_files else 0) + (1 if args.web else 0))
     st = Stages(total)
     audio = None
 
@@ -1333,8 +1820,9 @@ def process(video: Path, args, device: str) -> None:
 
             with st.stage("Przekazywanie transkrypcji, slajdów i materiałów do modelu"
                           if mat_files else "Przekazywanie transkrypcji i slajdów do modelu") as s:
-                partial = partial_notes(qwen, segments, slides, pages)
-                s.note = f"{len(partial)} fragmentów przeanalizowanych"
+                partial, reused = partial_notes(qwen, segments, slides, pages,
+                                                cache=None if args.force else out / ".notatki_czesciowe.json")
+                s.note = f"{len(partial)} fragmentów przeanalizowanych" + (f" ({reused} z cache)" if reused else "")
 
             web = ""
             if args.web:
@@ -1356,13 +1844,21 @@ def process(video: Path, args, device: str) -> None:
                 qwen.close()
 
         with st.stage("Zapis notatki") as s:
+            placement = ""
             if slides:
-                notes += "\n\n---\n\n## Slajdy\n\n" + "\n".join(
-                    f"**Slajd {x.index}** [{fmt_ts(x.time, False)}]\n\n![Slajd {x.index}](slajdy/{x.file})\n"
-                    for x in slides)
+                notes, st_ = embed_slides(notes, slides)
+                placement = f" — slajdy: {st_['przy_odwolaniu']} w treści, {st_['na_koncu']} w sekcji na końcu"
             note = out / f"{video.stem}_notatka.md"
-            note.write_text(notes + "\n", encoding="utf-8")
-            s.note = str(note.relative_to(video.parent))
+            note.write_text(notes, encoding="utf-8")
+            s.note = str(note.relative_to(video.parent)) + placement
+
+        if not args.no_pdf:
+            with st.stage("Eksport notatki do PDF") as s:
+                try:
+                    pdf, used = markdown_to_pdf(note)
+                    s.note = f"{pdf.relative_to(video.parent)} ({used})"
+                except Exception as e:
+                    s.skip(f"nie udało się: {err_msg(e)} – notatka .md jest gotowa")
 
     if slides:
         write_slides_md(out / "slajdy.md", slides)
@@ -1375,7 +1871,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         description="Lokalna transkrypcja nagrań (PL) z mówcami, slajdami i notatką do nauki. "
                     "Modele pobierają się przy pierwszym użyciu do ./models.",
     )
-    p.add_argument("paths", nargs="+", type=Path, help="pliki wideo/audio lub foldery z nimi")
+    p.add_argument("paths", nargs="+", type=Path,
+                   help="pliki wideo/audio lub foldery z nimi; plik .md = tylko konwersja gotowej notatki do PDF")
     p.add_argument("--speakers", action="store_true",
                    help="podział na mówców (pyannote community-1, bez tokenu)")
     p.add_argument("--extract", action="store_true", help="zapisz slajdy (istotne zmiany obrazu) jako JPG")
@@ -1411,6 +1908,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--web-queries", type=int, default=6, help="maks. liczba zapytań do wyszukiwarki")
     g.add_argument("--web-results", type=int, default=3, help="wyników na zapytanie")
 
+    p.add_argument("--no-pdf", action="store_true", help="nie twórz PDF z notatki (domyślnie powstaje z --summary)")
     p.add_argument("--force", action="store_true", help="licz wszystko od nowa (ignoruj cache)")
     a = p.parse_args(argv)
     if a.all:
@@ -1424,11 +1922,11 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def collect_files(paths: list[Path]) -> list[Path]:
-    exts = VIDEO_EXTS | AUDIO_EXTS
+    exts = VIDEO_EXTS | AUDIO_EXTS | {".md"}
     files = []
     for path in paths:
         if path.is_dir():
-            files += sorted(f for f in path.iterdir() if f.suffix.lower() in exts)
+            files += sorted(f for f in path.iterdir() if f.suffix.lower() in exts - {".md"})
         elif path.is_file():
             files.append(path)
         else:
@@ -1442,6 +1940,22 @@ def main(argv=None) -> int:
     if not files:
         print("Brak plików do przetworzenia.")
         return 1
+    # tryb "tylko PDF": python transcriber.py wyklad_wyniki/wyklad_notatka.md
+    md_files = [f for f in files if f.suffix.lower() == ".md"]
+    files = [f for f in files if f.suffix.lower() != ".md"]
+    failed = 0
+    for f in md_files:
+        print(_c("1", f"\n━━━ PDF: {f.name} ━━━"))
+        with Stages(1).stage("Eksport notatki do PDF") as s:
+            try:
+                pdf, used = markdown_to_pdf(f)
+                s.note = f"{pdf} ({used})"
+            except Exception as e:
+                failed += 1
+                s.skip(f"nie udało się: {err_msg(e, 300)}")
+    if not files:
+        return 1 if failed else 0
+
     device = detect_device(args.device)
     mode = " + ".join(["transkrypcja"] + [n for f, n in [(args.speakers, "mówcy"), (args.extract, "slajdy"),
                                                          (args.summary, "notatka"), (bool(args.materials), "materiały"),
@@ -1453,7 +1967,6 @@ def main(argv=None) -> int:
             print(_c("1;33", f"! Whisper użyje karty, ale PyTorch nie: {why}.") + "\n"
                   "  Qwen i rozpoznawanie mówców pójdą na CPU (wolno). Naprawa: pip install torch torchvision "
                   "--index-url https://download.pytorch.org/whl/cu128")
-    failed = 0
     for i, f in enumerate(files, 1):
         print(_c("1", f"\n━━━ [{i}/{len(files)}] {f.name} ━━━"))
         try:

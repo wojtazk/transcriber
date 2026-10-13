@@ -28,7 +28,7 @@ Wszystko działa na Twoim komputerze, w czystym Pythonie. Nie potrzebujesz chmur
 |---|---|
 | 📝 **Transkrypcja** | Whisper `large-v3-turbo` (domyślnie) lub `large-v3`. Timestampy jak w napisach. |
 | 🖼️ **Slajdy** `--extract` | Zapisuje slajd tylko przy istotnej zmianie treści. Kamerka, gestykulacja i powroty do starych slajdów nie tworzą duplikatów. |
-| 🧠 **Notatka** `--summary` | Qwen3-VL opisuje każdy slajd, a potem łączy opisy z transkrypcją w jedną notatkę do nauki. |
+| 🧠 **Notatka** `--summary` | Qwen3-VL opisuje każdy slajd, a potem łączy opisy z transkrypcją w jedną notatkę do nauki: `.md` + gotowy do druku **PDF** (wzory, tabele, slajdy). |
 | 📎 **Materiały** `--materials` | Prezentacja (PDF/PPTX), notatki (DOCX/TXT/MD) lub obrazy. Czysty tekst slajdów trafia do notatki zamiast odczytu z wideo. |
 | 🌐 **Internet** `--web` | Notatka uzupełniona definicjami i linkami z sieci (DuckDuckGo, bez klucza). |
 | 🗣️ **Mówcy** `--speakers` | Podział na `Mówca 1`, `Mówca 2`, … (pyannote community-1). Bez tokenu i bez zakładania konta. |
@@ -94,6 +94,7 @@ python transcriber.py wyklad.mp4 --web           # + notatka uzupełniona wiedz�
 python transcriber.py wyklad.mp4 --speakers      # + podział na mówców
 python transcriber.py wyklad.mp4 --materials prezentacja.pdf   # + czyste dane z prezentacji
 python transcriber.py wyklad.mp4 --all           # wszystko naraz
+python transcriber.py wyklad_wyniki/wyklad_notatka.md   # tylko PDF z gotowej notatki (np. po ręcznych poprawkach)
 ```
 
 Flagi można łączyć. Więcej przykładów:
@@ -132,6 +133,7 @@ Wszystko trafia do podfolderu obok nagrania:
 └── 📁 wyklad_wyniki/
     ├── 📝 wyklad_transkrypcja.txt   ← zawsze
     ├── 🧠 wyklad_notatka.md          ← --summary
+    ├── 📄 wyklad_notatka.pdf         ← --summary (chyba że --no-pdf)
     ├── 🖼️ slajdy.md                  ← --extract (galeria slajdów z opisami)
     └── 📁 slajdy/
         ├── slajd_001_00-00-12.jpg
@@ -160,7 +162,8 @@ Z `--speakers` każda linia dostaje nazwę mówcy: `[00:00:10.100 --> 00:00:13.9
 - `## Pytania kontrolne`: do samodzielnego sprawdzenia wiedzy
 - `## Z materiałów (nieomówione na wykładzie)`: treści z prezentacji, których nie było w nagraniu (tylko z `--materials`)
 - `## Dodatkowe materiały`: linki do źródeł (tylko z `--web`)
-- `## Slajdy`: wszystkie wydobyte slajdy jako obrazki
+- **slajdy przy tekście** – slajd stoi pod akapitem, w którym notatka się do niego odwołuje (np. „(slajd 3)”; maks. 3 pod jednym akapitem)
+- `## Slajdy bez odwołań w notatce` – pozostałe slajdy na końcu, każdy z opisem treści wygenerowanym przez Qwen3-VL
 
 ---
 
@@ -186,6 +189,7 @@ Z `--speakers` każda linia dostaje nazwę mówcy: `[00:00:10.100 --> 00:00:13.9
 | `--hf-token` | `$HF_TOKEN` | opcjonalny, tylko awaryjnie (patrz *Rozwiązywanie problemów*) |
 | `--web-queries` | `6` | maks. liczba zapytań do wyszukiwarki |
 | `--web-results` | `3` | liczba wyników na zapytanie |
+| `--no-pdf` | – | nie twórz PDF z notatki |
 | `--force` | – | ignoruj cache i licz wszystko od nowa |
 
 ---
@@ -227,7 +231,9 @@ Każdy unikalny slajd jest opisywany tylko raz.
 
 Bez `--extract` (np. dla nagrania samego dźwięku) całe materiały trafiają do notatki jako treść uzupełniająca.
 
-**Notatka.** Transkrypcja przeplatana opisami slajdów (po czasie) jest cięta na fragmenty mieszczące się w kontekście modelu. Każdy fragment dostaje notatkę cząstkową, a na końcu wszystkie są składane w jedną spójną notatkę.
+**Notatka.** Transkrypcja przeplatana opisami slajdów (po czasie) jest cięta na fragmenty mieszczące się w kontekście modelu, a każdy fragment dostaje szczegółową notatkę. Z nich powstaje „Przebieg wykładu”. Tytuł, TL;DR, pojęcia i pytania kontrolne model pisze osobno, krótkimi wywołaniami na skrócie całości. Dzięki temu długi wykład nie jest streszczany w jednym przebiegu i nic się nie ucina. Jeśli model dojdzie do limitu długości odpowiedzi, skrypt każe mu dokończyć od miejsca urwania. Gotowe notatki z fragmentów są zapisywane na bieżąco, więc po przerwaniu kolejne uruchomienie liczy tylko brakujące.
+
+**PDF.** Notatka jest zamieniana na HTML ze wzorami KaTeX i drukowana do PDF przez przeglądarkę: najpierw Chrome/Chromium/Edge z systemu, a jeśli go nie ma, Chromium pobierane jednorazowo do `models/playwright`. Bez internetu PDF i tak powstanie, tylko wzory zostaną jako tekst LaTeX. Możesz też ręcznie poprawić `.md` i wygenerować PDF jeszcze raz: `python transcriber.py wyklad_wyniki/wyklad_notatka.md`.
 
 **Internet.** Model sam wybiera, czego warto poszukać. Wyniki służą tylko do doprecyzowania, a treść wykładu ma pierwszeństwo. Informacje spoza wykładu są oznaczone, a źródła podlinkowane.
 
@@ -247,6 +253,7 @@ Pobierają się **przy pierwszym użyciu** do `./models/` obok skryptu, i tylko 
 | Qwen3-VL 4B, 4-bit | `--summary`, NVIDIA z mniejszą kartą | ~3.5 GB |
 | Qwen3-VL 4B, bf16 | `--summary`, sam CPU | ~9 GB |
 | pyannote community-1 | `--speakers` | ~33 MB |
+| Chromium (do PDF) | `--summary`, tylko gdy w systemie nie ma Chrome/Chromium/Edge | ~100 MB |
 
 Wersja Qwena dobiera się sama do sprzętu. Możesz ją wymusić przez `--qwen 2b|4b|8b`. Żeby zwolnić miejsce, usuń folder `models/`.
 
@@ -309,7 +316,7 @@ DuckDuckGo czasem ogranicza liczbę zapytań. Notatka i tak powstanie, tylko bez
 
 ## 🙏 Zbudowane na
 
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [mlx-whisper](https://github.com/ml-explore/mlx-examples) · [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) · [transformers](https://github.com/huggingface/transformers) · [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) · [OpenCV](https://opencv.org) · [pyannote.audio](https://github.com/pyannote/pyannote-audio) · [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) · [python-pptx](https://github.com/scanny/python-pptx) · [ddgs](https://github.com/deedy5/ddgs)
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [mlx-whisper](https://github.com/ml-explore/mlx-examples) · [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) · [transformers](https://github.com/huggingface/transformers) · [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) · [OpenCV](https://opencv.org) · [pyannote.audio](https://github.com/pyannote/pyannote-audio) · [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) · [Playwright](https://playwright.dev/python/) · [KaTeX](https://katex.org) · [python-pptx](https://github.com/scanny/python-pptx) · [ddgs](https://github.com/deedy5/ddgs)
 
 ## 📜 Licencje modeli
 

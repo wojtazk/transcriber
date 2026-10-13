@@ -25,6 +25,11 @@ pypdfium2
 python-pptx
 python-docx
 
+# --- eksport notatki do PDF ---
+markdown
+pymdown-extensions
+playwright
+
 # --- internet (--web) ---
 ddgs
 
